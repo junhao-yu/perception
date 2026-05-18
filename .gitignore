@@ -1,0 +1,17 @@
+__pycache__
+*.vscode
+cfg.yaml
+*.pth
+*.pt
+*.pkl
+*.pyc
+*.so
+*.egg-info
+# Ignore weight files but keep the folder structure
+weights/*
+!weights/.gitkeep
+yolov8/.venv/
+yolov8/dataset/
+yolov8/runs/
+output/
+.claude/
