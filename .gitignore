@@ -15,3 +15,4 @@ yolov8/dataset/
 yolov8/runs/
 output/
 .claude/
+models/
