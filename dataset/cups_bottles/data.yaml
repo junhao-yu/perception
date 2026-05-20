@@ -1,0 +1,7 @@
+path: /home/yu/perception/Fast-FoundationStereo/dataset/cups_bottles
+train: images/train
+val: images/val
+nc: 2
+names:
+  0: cup
+  1: bottle

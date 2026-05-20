@@ -18,6 +18,15 @@ Usage:
       --calib_file calibrations/stereo_calib.npz \
       --yolo_weights ../yolov8/runs/detect/train-3/weights/best.pt \
       --depth_scale 1.22
+
+  # YOLO-World v2 (open-vocabulary, fast):
+  python scripts/run_perception.py \
+      --detector_type yolo_world \
+      --model_dir weights/20-30-48/model_best_bp2_serialize.pth \
+      --calib_file calibrations/stereo_calib.npz \
+      --yolo_weights yolov8s-worldv2.pt \
+      --text_prompt "a cup. a bottle. a box." \
+      --depth_scale 1.22
 """
 
 import argparse, os, sys, time
@@ -32,7 +41,7 @@ import logging
 from core.utils.utils import InputPadder
 from Utils import AMP_DTYPE, set_logging_format, set_seed
 
-from detectors import YOLODetector, GroundingDINODetector
+from detectors import YOLODetector, GroundingDINODetector, YOLOWorldDetector
 from perception import PerceptionPipeline
 
 
@@ -61,7 +70,7 @@ COLORS = [
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--detector_type', type=str, required=True,
-                        choices=['yolo', 'grounding_dino'])
+                        choices=['yolo', 'grounding_dino', 'yolo_world'])
     # FFS
     parser.add_argument('--model_dir', type=str, required=True)
     parser.add_argument('--calib_file', type=str, default=None)
@@ -73,7 +82,7 @@ def main():
     parser.add_argument('--cam_width', default=1280, type=int)
     parser.add_argument('--cam_height', default=480, type=int)
     parser.add_argument('--scale', default=1.0, type=float)
-    # YOLO
+    # YOLO / YOLO-World
     parser.add_argument('--yolo_weights', type=str, default=None)
     parser.add_argument('--yolo_conf', default=0.5, type=float)
     # Grounding DINO
@@ -108,6 +117,10 @@ def main():
     if args.detector_type == 'yolo':
         logging.info(f"Loading YOLO: {args.yolo_weights}")
         detector = YOLODetector(args.yolo_weights, conf=args.yolo_conf)
+    elif args.detector_type == 'yolo_world':
+        logging.info(f"Loading YOLO-World v2: {args.yolo_weights}")
+        logging.info(f"Detection prompt: {args.text_prompt}")
+        detector = YOLOWorldDetector(args.yolo_weights, args.text_prompt, conf=args.yolo_conf)
     else:
         logging.info(f"Loading Grounding DINO: {args.gdino_model}")
         logging.info(f"Detection prompt: {args.text_prompt}")
@@ -118,13 +131,15 @@ def main():
         )
 
     # --- Pipeline ---
-    pipeline = PerceptionPipeline(detector, ffs_model, calib, args.depth_scale)
+    pipeline = PerceptionPipeline(detector, ffs_model, calib, args.depth_scale,
+                                   image_scale=args.scale)
 
     # --- Camera ---
     cap = cv2.VideoCapture(args.cam_id, cv2.CAP_V4L2)
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, args.cam_width)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, args.cam_height)
     cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
+    cap.set(cv2.CAP_PROP_FPS, 60)
     cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
     assert cap.isOpened(), f"Cannot open /dev/video{args.cam_id}"
     for _ in range(10):
@@ -157,9 +172,14 @@ def main():
 
     # --- Main loop ---
     fps_window = []
+    timing = {'cap_read': [], 'remap': [], 'resize': [], 'pipeline': [], 'display': []}
+    frame_count = 0
+
     print("\n" + "=" * 60)
     print(f"Detector: {args.detector_type}  |  Stereo: FFS  |  depth_scale={args.depth_scale}")
-    if args.detector_type == 'grounding_dino':
+    if args.scale != 1.0:
+        print(f"Image scale: {args.scale}")
+    if args.detector_type in ('grounding_dino', 'yolo_world'):
         print(f"Prompt: {args.text_prompt}")
     print("Press 'q' or ESC to exit.")
     print("=" * 60 + "\n")
@@ -167,24 +187,34 @@ def main():
     while True:
         t_start = time.perf_counter()
 
+        t0 = time.perf_counter()
         ret, frame = cap.read()
+        t_cap = time.perf_counter() - t0
         if not ret:
             continue
 
+        # --- Preprocess ---
+        t0 = time.perf_counter()
         mid = frame.shape[1] // 2
         img_l = frame[:, :mid, :3]
         img_r = frame[:, mid:, :3]
         img_l = cv2.remap(img_l, map_lx, map_ly, cv2.INTER_LINEAR)
         img_r = cv2.remap(img_r, map_rx, map_ry, cv2.INTER_LINEAR)
+        t_remap = time.perf_counter() - t0
 
+        t0 = time.perf_counter()
         if args.scale != 1.0:
             img_l = cv2.resize(img_l, fx=args.scale, fy=args.scale, dsize=None)
             img_r = cv2.resize(img_r, dsize=(img_l.shape[1], img_l.shape[0]))
+        t_resize = time.perf_counter() - t0
 
         # --- Pipeline: detect + depth + fuse ---
+        t0 = time.perf_counter()
         disp_vis, depth_m, detections_3d = pipeline.process_frame(img_l, img_r)
+        t_pipeline = time.perf_counter() - t0
 
         # --- Display ---
+        t0 = time.perf_counter()
         display = np.concatenate([img_l, img_r, disp_vis], axis=1)
 
         for det, pos_3d in detections_3d:
@@ -210,6 +240,30 @@ def main():
             cv2.imshow('Perception Pipeline', display_small)
             if cv2.waitKey(1) & 0xFF in (ord('q'), 27):
                 break
+        t_display = time.perf_counter() - t0
+
+        # --- Accumulate timing ---
+        timing['cap_read'].append(t_cap * 1000)
+        timing['remap'].append(t_remap * 1000)
+        timing['resize'].append(t_resize * 1000)
+        timing['pipeline'].append(t_pipeline * 1000)
+        timing['display'].append(t_display * 1000)
+        frame_count += 1
+
+        if frame_count % 30 == 0:
+            print(f"\n--- Frame {frame_count}: avg timing (ms) over last 30 frames ---")
+            for step in ['cap_read', 'remap', 'resize', 'pipeline', 'display']:
+                vals = timing[step]
+                if vals:
+                    print(f"  {step:10s}: {np.mean(vals):6.1f}  (max: {np.max(vals):6.1f})")
+            total_ms = sum(np.mean(timing[k]) for k in timing if timing[k])
+            print(f"  {'TOTAL':10s}: {total_ms:6.1f}  (~{1000/total_ms:.0f} FPS max)")
+            pt = pipeline.last_timing
+            print(f"  ── pipeline internals ──")
+            for k, v in pt.items():
+                print(f"    {k:8s}: {v:6.1f}")
+            for k in timing:
+                timing[k].clear()
 
     cap.release()
     cv2.destroyAllWindows()

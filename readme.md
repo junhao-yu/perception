@@ -124,41 +124,205 @@ python scripts/check_depth.py \
 
 If measured depth is consistently shorter than ground truth, increase `--depth_scale` (e.g. 1.22 means depth is 22% too short). All live scripts accept `--depth_scale`.
 
-# YOLOv8 + Stereo: 3D object detection
+# Detection + Stereo: 3D object localization
 
-Detect objects with YOLOv8 and estimate their 3D position from stereo depth.
+Unified perception pipeline: detector → stereo depth → 3D position. Three detector backends available, switchable via `--detector_type`.
 
 ## Install
 
 ```bash
+# YOLO / YOLO-World backend (conda env: ffs)
 pip install ultralytics
+
+# Grounding DINO backend (conda env: ffs1 — also needs ultralytics for YOLO-World)
+pip install transformers
+# Download model:
+HF_ENDPOINT=https://hf-mirror.com hf download IDEA-Research/grounding-dino-tiny \
+    --local-dir models/grounding-dino-tiny
 ```
+
+## Detector comparison (RTX 5060 Laptop, --scale 0.5)
+
+| Detector          | detect (ms) | total FPS | Open-vocabulary | Fine-tunable |
+|-------------------|:-----------:|:---------:|:---------------:|:------------:|
+| YOLO-World v2     | ~4          | ~25       | Yes             | Yes          |
+| YOLOv8            | ~4          | ~25       | No (train req'd)| Yes          |
+| Grounding DINO    | ~250        | ~3        | Yes             | No           |
+
+All detectors share `--text_prompt` (`.`-separated, English). YOLO-World v2 is recommended — fast like YOLOv8, open-vocabulary like DINO, and fine-tunable with 5-10 images per class.
 
 ## Run
 
+### YOLO-World v2 (recommended)
+
 ```bash
-python scripts/live_yolo_stereo.py \
+python scripts/run_perception.py \
+    --detector_type yolo_world \
+    --model_dir weights/20-30-48/model_best_bp2_serialize.pth \
+    --calib_file calibrations/stereo_calib.npz \
+    --yolo_weights yolov8s-worldv2.pt \
+    --text_prompt "a cup. a bottle. a box." \
+    --depth_scale 1.22 \
+    --scale 0.5
+```
+
+Weights auto-download on first run from GitHub. In China, pre-download with: `wget https://gh-proxy.com/https://github.com/ultralytics/assets/releases/download/v8.3.0/yolov8s-worldv2.pt`. Variants: `s` (small), `m` (medium), `l` (large).
+
+### YOLO (trained model — fast, fixed classes)
+
+```bash
+python scripts/run_perception.py \
+    --detector_type yolo \
     --model_dir weights/20-30-48/model_best_bp2_serialize.pth \
     --calib_file calibrations/stereo_calib.npz \
     --yolo_weights ../yolov8/runs/detect/train-3/weights/best.pt \
-    --yolo_conf 0.5 \
     --depth_scale 1.22 \
-    --cam_id 2
+    --scale 0.5
 ```
 
-| Flag              | Meaning                                                |
-|-------------------|--------------------------------------------------------|
-| `--yolo_weights`  | Path to YOLOv8 trained weights (.pt)                   |
-| `--yolo_conf`     | Detection confidence threshold (default 0.5)           |
-| `--depth_scale`   | Depth scale correction factor (default 1.0)            |
-| `--cam_id`        | V4L2 camera device index (default 2 for DECXIN)        |
-| `--cam_width`     | Combined stereo frame width (default 1280)             |
-| `--cam_height`    | Frame height (default 480)                             |
-| `--valid_iters`   | GRU refinement iterations (4 for speed, 8 for quality) |
-| `--scale`         | Image scale factor (<1 for faster inference)           |
+### Grounding DINO (open-vocabulary — slow, best zero-shot accuracy)
 
-Each detected object shows: confidence, X (right), Y (down), Z (forward) in meters.
+```bash
+python scripts/run_perception.py \
+    --detector_type grounding_dino \
+    --model_dir weights/20-30-48/model_best_bp2_serialize.pth \
+    --calib_file calibrations/stereo_calib.npz \
+    --gdino_model models/grounding-dino-tiny \
+    --text_prompt "a cup. a bottle. a box. a person." \
+    --depth_scale 1.22
+```
+
+| Flag                | Meaning                                                |
+|---------------------|--------------------------------------------------------|
+| `--detector_type`   | `yolo`, `yolo_world`, or `grounding_dino`              |
+| `--model_dir`       | Path to FFS weights                                    |
+| `--calib_file`      | Path to stereo calibration .npz                        |
+| `--depth_scale`     | Depth scale correction factor (default 1.0)            |
+| `--cam_id`          | V4L2 camera device index (default 2 for DECXIN)        |
+| `--cam_width`       | Combined stereo frame width (default 1280)             |
+| `--cam_height`      | Frame height (default 480)                             |
+| `--valid_iters`     | GRU refinement iterations (4 for speed, 8 for quality) |
+| `--scale`           | Image scale factor (0.5 recommended for speed)         |
+|                      |                                                        |
+| **Open-vocabulary options** (yolo_world & grounding_dino) |                              |
+| `--text_prompt`     | Text description of objects to detect, `.` separated   |
+|                      |                                                        |
+| **Grounding DINO options** |                                                  |
+| `--gdino_model`     | Path to Grounding DINO model                           |
+| `--box_threshold`   | Box confidence threshold (default 0.3)                 |
+| `--text_threshold`  | Text similarity threshold (default 0.25)               |
+|                      |                                                        |
+| **YOLO / YOLO-World options** |                                                   |
+| `--yolo_weights`    | Path to YOLO/YOLO-World weights (.pt)                  |
+| `--yolo_conf`       | Detection confidence threshold (default 0.5)           |
+
+Each detected object shows: class label, confidence, X (right), Y (down), Z (forward) in meters.
 
 Camera coordinate system: origin at left lens optical center, X right, Y down, Z forward.
+
+### Legacy standalone scripts
+
+```bash
+python scripts/live_yolo_stereo.py ...        # YOLO standalone (reference)
+python scripts/live_grounding_stereo.py ...   # Grounding DINO standalone (reference)
+```
+
+Prefer `scripts/run_perception.py` for new work.
+
+# Fine-tune YOLO-World v2
+
+Improve detection accuracy on specific objects with few-shot fine-tuning. **5-10 images per class** is often enough — the model already has strong open-vocabulary priors; fine-tuning only needs to adapt to your camera viewpoint and lighting.
+
+Example results (cup+bottle, 15 images, 12 train / 3 val, 20 epochs):
+- cup mAP50-95: 99.5%
+- bottle mAP50-95: 79.0%
+- Inference: 2.5ms per frame
+
+## Workflow
+
+### 1. Capture dataset
+
+Press **SPACE** to save left-eye frames. Move objects to varied positions and angles.
+
+```bash
+python scripts/capture_dataset.py \
+    --calib_file calibrations/stereo_calib.npz \
+    --out_dir dataset/cups_bottles/
+```
+
+### 2. Annotate with labelImg
+
+```bash
+pip install labelImg
+labelImg dataset/cups_bottles/ dataset/cups_bottles/
+```
+
+Draw bounding boxes for each object, assign class labels (e.g., `cup`, `bottle`). labelImg saves LabelMe JSON format — `convert_labels.py` handles the conversion.
+
+### 3. Convert annotations to YOLO format
+
+```bash
+python scripts/convert_labels.py \
+    --json_dir dataset/cups_bottles/ \
+    --classes "cup,bottle"
+```
+
+This outputs `labels/*.txt` in YOLO format. Class IDs match `--classes` order (e.g., `cup,bottle` → cup=0, bottle=1).
+
+### 4. Organize files (if needed)
+
+If images are in the same directory as JSONs:
+
+```bash
+mkdir -p dataset/cups_bottles/images
+mv dataset/cups_bottles/*.jpg dataset/cups_bottles/images/
+```
+
+Final structure:
+```
+dataset/cups_bottles/
+├── images/
+│   ├── frame_00000.jpg
+│   └── ...
+├── labels/
+│   ├── frame_00000.txt    # 0 0.375 0.639 0.066 0.143 ...
+│   └── ...
+└── data.yaml              # auto-generated by finetune script
+```
+
+### 5. Fine-tune
+
+```bash
+python scripts/finetune_yolo_world.py \
+    --weights yolov8s-worldv2.pt \
+    --data_dir dataset/cups_bottles/ \
+    --classes "cup,bottle" \
+    --epochs 20 \
+    --batch 2 \
+    --out_dir weights/yolo_world_finetuned/
+```
+
+| Flag           | Meaning                                               |
+|----------------|-------------------------------------------------------|
+| `--weights`    | Base YOLO-World weights (auto-downloaded first time)  |
+| `--data_dir`   | Dataset directory with `images/` and `labels/`        |
+| `--classes`    | Comma-separated class names                           |
+| `--epochs`     | 5-10 for tiny datasets (5-10 imgs), 20-30 for 15-50   |
+| `--batch`      | Reduce to 2 if OOM (default 4)                        |
+| `--lr0`        | Keep low for fine-tuning (default 0.001)              |
+| `--out_dir`    | Output directory for trained model                    |
+
+### 6. Run with fine-tuned model
+
+```bash
+python scripts/run_perception.py \
+    --detector_type yolo_world \
+    --model_dir weights/20-30-48/model_best_bp2_serialize.pth \
+    --calib_file calibrations/stereo_calib.npz \
+    --yolo_weights weights/yolo_world_finetuned/model_best.pt \
+    --text_prompt "a cup. a bottle." \
+    --depth_scale 1.22 \
+    --scale 0.5
+```
 
 

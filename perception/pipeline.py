@@ -19,11 +19,14 @@ class PerceptionPipeline:
     """Detection + stereo depth → 3D object positions."""
 
     def __init__(self, detector: BaseDetector, ffs_model,
-                 calib: dict, depth_scale: float = 1.0):
+                 calib: dict, depth_scale: float = 1.0,
+                 image_scale: float = 1.0):
         self.detector = detector
         self.ffs_model = ffs_model
         self.calib = calib
         self.depth_scale = depth_scale
+        self.image_scale = image_scale
+        self.last_timing = {}
 
     def process_frame(self, img_l: np.ndarray, img_r: np.ndarray):
         """Run detection and stereo on a rectified stereo pair.
@@ -34,11 +37,15 @@ class PerceptionPipeline:
             detections_3d: list of (detection, pos_3d) tuples
         """
         H, W = img_l.shape[:2]
+        t_total = time.perf_counter()
 
         # --- Detection on left image ---
+        t0 = time.perf_counter()
         detections = self.detector.detect(img_l)
+        t_detect = time.perf_counter() - t0
 
         # --- FFS stereo depth ---
+        t0 = time.perf_counter()
         t_l = torch.as_tensor(img_l).cuda().float()[None].permute(0, 3, 1, 2)
         t_r = torch.as_tensor(img_r).cuda().float()[None].permute(0, 3, 1, 2)
         padder = InputPadder(t_l.shape, divis_by=32, force_square=False)
@@ -49,17 +56,27 @@ class PerceptionPipeline:
                                           test_mode=True, optimize_build_volume='pytorch1')
         disp = padder.unpad(disp.float())
         disp_np = disp.data.cpu().numpy().reshape(H, W).clip(0, None)
+        t_ffs = time.perf_counter() - t0
 
-        # Depth
-        K = self.calib['K']
+        # Depth — scale K to match image resolution
+        t0_d = time.perf_counter()
+        K = self.calib['K'].copy()
+        s = self.image_scale
+        if s != 1.0:
+            K[0, 0] *= s  # fx
+            K[1, 1] *= s  # fy
+            K[0, 2] *= s  # cx
+            K[1, 2] *= s  # cy
         baseline = self.calib['baseline']
         depth_m = K[0, 0] * baseline / disp_np.clip(0.1, None) * self.depth_scale
 
         # Visualize disparity
         disp_vis = vis_disparity(disp_np, min_val=None, max_val=None, cmap=None,
                                  color_map=cv2.COLORMAP_TURBO)
+        t_depth = time.perf_counter() - t0_d
 
         # --- Fuse: bbox → depth → 3D ---
+        t0_fuse = time.perf_counter()
         detections_3d = []
         for det in detections:
             x1, y1, x2, y2 = det.bbox
@@ -69,6 +86,15 @@ class PerceptionPipeline:
                 cy = (y1 + y2) / 2
                 pos_3d = self._pixel_to_camera(cx, cy, d, K)
                 detections_3d.append((det, pos_3d))
+        t_fuse = time.perf_counter() - t0_fuse
+
+        self.last_timing = {
+            'detect': t_detect * 1000,
+            'ffs': t_ffs * 1000,
+            'depth_vis': t_depth * 1000,
+            'fuse': t_fuse * 1000,
+            'total': (time.perf_counter() - t_total) * 1000,
+        }
 
         return disp_vis, depth_m, detections_3d
 
