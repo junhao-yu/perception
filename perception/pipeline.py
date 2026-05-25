@@ -20,12 +20,21 @@ class PerceptionPipeline:
 
     def __init__(self, detector: BaseDetector, ffs_model,
                  calib: dict, depth_scale: float = 1.0,
-                 image_scale: float = 1.0):
+                 image_scale: float = 1.0,
+                 disp_offset: float = 0.0):
+        """
+        Args:
+            depth_scale: multiplicative correction for fx*baseline error.
+            disp_offset: additive disparity correction (pixels).
+                         Compensates for constant stereo matching bias.
+                         depth = fx*baseline / (disp + disp_offset) * depth_scale
+        """
         self.detector = detector
         self.ffs_model = ffs_model
         self.calib = calib
         self.depth_scale = depth_scale
         self.image_scale = image_scale
+        self.disp_offset = disp_offset
         self.last_timing = {}
 
     def process_frame(self, img_l: np.ndarray, img_r: np.ndarray):
@@ -68,7 +77,8 @@ class PerceptionPipeline:
             K[0, 2] *= s  # cx
             K[1, 2] *= s  # cy
         baseline = self.calib['baseline']
-        depth_m = K[0, 0] * baseline / disp_np.clip(0.1, None) * self.depth_scale
+        disp_corrected = disp_np + self.disp_offset
+        depth_m = K[0, 0] * baseline / disp_corrected.clip(0.1, None) * self.depth_scale
 
         # Visualize disparity
         disp_vis = vis_disparity(disp_np, min_val=None, max_val=None, cmap=None,

@@ -77,6 +77,8 @@ def main():
     parser.add_argument('--valid_iters', default=4, type=int)
     parser.add_argument('--max_disp', default=192, type=int)
     parser.add_argument('--depth_scale', default=1.0, type=float)
+    parser.add_argument('--disp_offset', default=0.0, type=float,
+                        help='Constant disparity correction (pixels). Compensates for FFS bias.')
     # Camera
     parser.add_argument('--cam_id', default=2, type=int)
     parser.add_argument('--cam_width', default=1280, type=int)
@@ -92,6 +94,8 @@ def main():
     parser.add_argument('--text_threshold', type=float, default=0.25)
     # Display
     parser.add_argument('--display', type=int, default=1)
+    parser.add_argument('--save_dir', type=str, default=None,
+                        help='Directory to save screenshots (press S key)')
     args = parser.parse_args()
 
     set_logging_format()
@@ -130,9 +134,17 @@ def main():
             text_threshold=args.text_threshold,
         )
 
-    # --- Pipeline ---
+    # --- Save dir ---
+    import datetime as _dt
+    if args.save_dir:
+        save_dir = os.path.join(args.save_dir, _dt.datetime.now().strftime('%Y%m%d_%H%M%S'))
+        os.makedirs(save_dir, exist_ok=True)
+        logging.info(f"Screenshots will be saved to: {save_dir}")
+    else:
+        save_dir = None
     pipeline = PerceptionPipeline(detector, ffs_model, calib, args.depth_scale,
-                                   image_scale=args.scale)
+                                   image_scale=args.scale,
+                                   disp_offset=args.disp_offset)
 
     # --- Camera ---
     cap = cv2.VideoCapture(args.cam_id, cv2.CAP_V4L2)
@@ -181,7 +193,8 @@ def main():
         print(f"Image scale: {args.scale}")
     if args.detector_type in ('grounding_dino', 'yolo_world'):
         print(f"Prompt: {args.text_prompt}")
-    print("Press 'q' or ESC to exit.")
+    save_hint = " | 'S' = save screenshot" if save_dir else ""
+    print(f"Press 'q' or ESC to exit{save_hint}.")
     print("=" * 60 + "\n")
 
     while True:
@@ -238,8 +251,23 @@ def main():
             ds = 1280 / display.shape[1]
             display_small = cv2.resize(display, (int(display.shape[1] * ds), int(display.shape[0] * ds)))
             cv2.imshow('Perception Pipeline', display_small)
-            if cv2.waitKey(1) & 0xFF in (ord('q'), 27):
+            key = cv2.waitKey(1) & 0xFF
+            if key in (ord('q'), 27):
                 break
+            elif key == ord('s') and save_dir:
+                ts = _dt.datetime.now().strftime('%H%M%S_%f')[:9]
+                fname = os.path.join(save_dir, f'frame_{frame_count:05d}_{ts}.png')
+                cv2.imwrite(fname, display)
+                print(f"  Screenshot saved: {fname}")
+                # Also save detection results
+                txt_name = os.path.join(save_dir, f'frame_{frame_count:05d}_{ts}.txt')
+                with open(txt_name, 'w') as f:
+                    f.write(f"# Detection results  |  detector: {args.detector_type}\n")
+                    f.write(f"# FPS: {avg_fps:.1f}  |  scale: {args.scale}\n")
+                    for det, pos_3d in detections_3d:
+                        f.write(f"{det.label} conf={det.score:.3f} bbox={det.bbox} "
+                                f"X={pos_3d[0]:.3f} Y={pos_3d[1]:.3f} Z={pos_3d[2]:.3f}m\n")
+                print(f"  Results saved: {txt_name}")
         t_display = time.perf_counter() - t0
 
         # --- Accumulate timing ---

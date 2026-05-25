@@ -325,4 +325,14 @@ python scripts/run_perception.py \
     --scale 0.5
 ```
 
-
+```bash
+python scripts/run_perception.py \
+    --detector_type yolo_world \
+    --model_dir weights/20-30-48/model_best_bp2_serialize.pth \
+    --calib_file calibrations/stereo_calib.npz \
+    --yolo_weights weights/yolo_world_finetuned/model_best.pt \
+    --text_prompt "a cup. a bottle." \
+    --depth_scale 1.1513 \
+    --disp_offset 0.8668 \
+    --scale 0.5 --save_dir output/screenshots/
+```
