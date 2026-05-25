@@ -16,3 +16,4 @@ yolov8/runs/
 output/
 .claude/
 models/
+docs/
