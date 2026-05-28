@@ -43,6 +43,7 @@ from Utils import AMP_DTYPE, set_logging_format, set_seed
 
 from detectors import YOLODetector, GroundingDINODetector, YOLOWorldDetector
 from perception import PerceptionPipeline
+from shm_camera import SharedMemoryStereoReader
 
 
 def load_calibration(npz_path):
@@ -80,9 +81,19 @@ def main():
     parser.add_argument('--disp_offset', default=0.0, type=float,
                         help='Constant disparity correction (pixels). Compensates for FFS bias.')
     # Camera
-    parser.add_argument('--cam_id', default=2, type=int)
-    parser.add_argument('--cam_width', default=1280, type=int)
-    parser.add_argument('--cam_height', default=480, type=int)
+    parser.add_argument('--cam_mode', type=str, default='v4l2', choices=['v4l2', 'shm'],
+                        help='v4l2 = single side-by-side UVC camera (old); '
+                             'shm = stereo pair via shared memory from camera_bridge.py')
+    parser.add_argument('--cam_id', default=2, type=int,
+                        help='V4L2 device index (--cam_mode v4l2 only)')
+    parser.add_argument('--cam_width', default=1280, type=int,
+                        help='Combined frame width (--cam_mode v4l2 only)')
+    parser.add_argument('--cam_height', default=480, type=int,
+                        help='Frame height (--cam_mode v4l2 only)')
+    parser.add_argument('--cam_left_sensor', default=0, type=int,
+                        help='nvarguscamerasrc sensor-id for left camera (for reference)')
+    parser.add_argument('--cam_right_sensor', default=1, type=int,
+                        help='nvarguscamerasrc sensor-id for right camera (for reference)')
     parser.add_argument('--scale', default=1.0, type=float)
     # YOLO / YOLO-World
     parser.add_argument('--yolo_weights', type=str, default=None)
@@ -147,22 +158,41 @@ def main():
                                    disp_offset=args.disp_offset)
 
     # --- Camera ---
-    cap = cv2.VideoCapture(args.cam_id, cv2.CAP_V4L2)
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, args.cam_width)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, args.cam_height)
-    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
-    cap.set(cv2.CAP_PROP_FPS, 60)
-    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-    assert cap.isOpened(), f"Cannot open /dev/video{args.cam_id}"
-    for _ in range(10):
-        cap.read()
+    if args.cam_mode == 'shm':
+        logging.info("Opening shared memory stereo camera...")
+        cap = None
+        shm_reader = SharedMemoryStereoReader()
+        cam_w, cam_h = shm_reader.width, shm_reader.height
+        logging.info(f"Shared memory camera: {cam_w}x{cam_h}")
+    else:
+        cap = cv2.VideoCapture(args.cam_id, cv2.CAP_V4L2)
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, args.cam_width)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, args.cam_height)
+        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
+        cap.set(cv2.CAP_PROP_FPS, 60)
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        assert cap.isOpened(), f"Cannot open /dev/video{args.cam_id}"
+        for _ in range(10):
+            cap.read()
+        shm_reader = None
+
+    def read_frames():
+        """Read stereo frames — works with both V4L2 and shared memory."""
+        if shm_reader is not None:
+            return shm_reader.read()
+        else:
+            ret, frame = cap.read()
+            if not ret:
+                return None, None
+            mid = frame.shape[1] // 2
+            return frame[:, :mid, :3], frame[:, mid:, :3]
 
     # --- Warmup ---
     logging.info("Warming up...")
-    ret, frame = cap.read()
-    mid = frame.shape[1] // 2
-    img_l = frame[:, :mid, :3]
-    img_r = frame[:, mid:, :3]
+    img_l, img_r = read_frames()
+    if img_l is None:
+        logging.error("Failed to capture warmup frame")
+        return
     img_l = cv2.remap(img_l, map_lx, map_ly, cv2.INTER_LINEAR)
     img_r = cv2.remap(img_r, map_rx, map_ry, cv2.INTER_LINEAR)
     if args.scale != 1.0:
@@ -188,7 +218,8 @@ def main():
     frame_count = 0
 
     print("\n" + "=" * 60)
-    print(f"Detector: {args.detector_type}  |  Stereo: FFS  |  depth_scale={args.depth_scale}")
+    cam_str = f"SHM (dual IMX185)" if args.cam_mode == 'shm' else f"V4L2 /dev/video{args.cam_id}"
+    print(f"Camera: {cam_str}  |  Detector: {args.detector_type}  |  Stereo: FFS  |  depth_scale={args.depth_scale}")
     if args.scale != 1.0:
         print(f"Image scale: {args.scale}")
     if args.detector_type in ('grounding_dino', 'yolo_world'):
@@ -201,16 +232,10 @@ def main():
         t_start = time.perf_counter()
 
         t0 = time.perf_counter()
-        ret, frame = cap.read()
+        img_l, img_r = read_frames()
         t_cap = time.perf_counter() - t0
-        if not ret:
+        if img_l is None:
             continue
-
-        # --- Preprocess ---
-        t0 = time.perf_counter()
-        mid = frame.shape[1] // 2
-        img_l = frame[:, :mid, :3]
-        img_r = frame[:, mid:, :3]
         img_l = cv2.remap(img_l, map_lx, map_ly, cv2.INTER_LINEAR)
         img_r = cv2.remap(img_r, map_rx, map_ry, cv2.INTER_LINEAR)
         t_remap = time.perf_counter() - t0
@@ -293,7 +318,10 @@ def main():
             for k in timing:
                 timing[k].clear()
 
-    cap.release()
+    if cap is not None:
+        cap.release()
+    if shm_reader is not None:
+        shm_reader.close()
     cv2.destroyAllWindows()
     logging.info(f"Finished.")
 

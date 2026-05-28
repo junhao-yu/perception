@@ -1,19 +1,29 @@
 """
-Stereo camera calibration tool for DECXIN-2784V1 (and other UVC stereo cameras).
+Stereo camera calibration tool for DECXIN-2784V1 (and other UVC stereo cameras)
+and GEAC IMX185 via camera bridge.
+
 Captures chessboard images from both eyes simultaneously and computes:
   - Individual camera intrinsics (K_left, K_right)
   - Distortion coefficients (D_left, D_right)
   - Stereo extrinsics (R, T)
   - Rectification transforms (R1, R2, P1, P2, Q)
 
-Usage:
-  python scripts/calibrate_stereo.py --out_dir calibrations/ --cam_id 2
+Usage (old USB camera):
+  python scripts/calibrate_stereo.py --cam_id 2 --width 1280 --height 480
+
+Usage (GEAC IMX185 via camera bridge, run camera_bridge.py on host first):
+  python scripts/calibrate_stereo.py --cam_mode shm
 """
 
 import argparse
 import os
+import sys
 import numpy as np
 import cv2
+
+code_dir = os.path.dirname(os.path.realpath(__file__))
+sys.path.append(code_dir)
+from shm_camera import SharedMemoryStereoReader
 
 
 CHESSBOARD = (9, 6)  # inner corners (cols, rows)
@@ -23,9 +33,11 @@ SQUARE_SIZE = 0.025  # meters — measure your chessboard square size
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--out_dir', default='calibrations', type=str)
-    parser.add_argument('--cam_id', default=2, type=int, help='V4L2 device index for DECXIN camera')
-    parser.add_argument('--width', default=1280, type=int)
-    parser.add_argument('--height', default=480, type=int)
+    parser.add_argument('--cam_mode', type=str, default='v4l2', choices=['v4l2', 'shm'],
+                        help='v4l2 = single side-by-side UVC camera; shm = stereo pair via camera_bridge.py')
+    parser.add_argument('--cam_id', default=2, type=int, help='V4L2 device index (--cam_mode v4l2 only)')
+    parser.add_argument('--width', default=1280, type=int, help='Combined frame width (--cam_mode v4l2 only)')
+    parser.add_argument('--height', default=480, type=int, help='Frame height (--cam_mode v4l2 only)')
     parser.add_argument('--chessboard_cols', default=9, type=int)
     parser.add_argument('--chessboard_rows', default=6, type=int)
     parser.add_argument('--square_size', default=0.025, type=float, help='Checkerboard square size in meters')
@@ -42,29 +54,43 @@ def main():
     imgpoints_l = []
     imgpoints_r = []
 
-    cap = cv2.VideoCapture(args.cam_id, cv2.CAP_V4L2)
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, args.width)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, args.height)
-    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
-    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-
-    if not cap.isOpened():
-        print(f"ERROR: Cannot open /dev/video{args.cam_id}")
-        return
-
     os.makedirs(args.out_dir, exist_ok=True)
+
+    if args.cam_mode == 'shm':
+        print("Opening shared memory stereo camera...")
+        cap = None
+        shm_reader = SharedMemoryStereoReader()
+        cam_w, cam_h = shm_reader.width, shm_reader.height
+        print(f"Camera: {cam_w}x{cam_h} (via camera bridge)")
+    else:
+        cap = cv2.VideoCapture(args.cam_id, cv2.CAP_V4L2)
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, args.width)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, args.height)
+        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        if not cap.isOpened():
+            print(f"ERROR: Cannot open /dev/video{args.cam_id}")
+            return
+        shm_reader = None
+
+    def read_frames():
+        if shm_reader is not None:
+            return shm_reader.read()
+        else:
+            ret, frame = cap.read()
+            if not ret:
+                return None, None
+            mid = frame.shape[1] // 2
+            return frame[:, :mid], frame[:, mid:]
+
     collected = 0
     print(f"Collecting calibration frames. Press SPACE to capture, ESC to finish.")
     print(f"Min frames needed: ~15. Captured: 0")
 
     while collected < args.max_frames:
-        ret, frame = cap.read()
-        if not ret:
+        img_l, img_r = read_frames()
+        if img_l is None:
             continue
-
-        mid = frame.shape[1] // 2
-        img_l = frame[:, :mid]
-        img_r = frame[:, mid:]
 
         gray_l = cv2.cvtColor(img_l, cv2.COLOR_BGR2GRAY)
         gray_r = cv2.cvtColor(img_r, cv2.COLOR_BGR2GRAY)
@@ -72,10 +98,11 @@ def main():
         ret_l, corners_l = cv2.findChessboardCorners(gray_l, pattern, None)
         ret_r, corners_r = cv2.findChessboardCorners(gray_r, pattern, None)
 
-        display = frame.copy()
+        display = np.concatenate([img_l, img_r], axis=1)
         if ret_l and ret_r:
             cv2.cornerSubPix(gray_l, corners_l, (11, 11), (-1, -1), criteria)
             cv2.cornerSubPix(gray_r, corners_r, (11, 11), (-1, -1), criteria)
+            mid = img_l.shape[1]
             cv2.drawChessboardCorners(display[:, :mid], pattern, corners_l, ret_l)
             cv2.drawChessboardCorners(display[:, mid:], pattern, corners_r, ret_r)
             status = "READY - press SPACE to capture"
@@ -99,7 +126,10 @@ def main():
         elif key == 27:  # ESC
             break
 
-    cap.release()
+    if cap is not None:
+        cap.release()
+    if shm_reader is not None:
+        shm_reader.close()
     cv2.destroyAllWindows()
 
     if collected < 10:
@@ -159,19 +189,29 @@ def main():
     map_lx, map_ly = cv2.initUndistortRectifyMap(K_l, D_l, R1, P1, (w, h), cv2.CV_32FC1)
     map_rx, map_ry = cv2.initUndistortRectifyMap(K_r, D_r, R2, P2, (w, h), cv2.CV_32FC1)
 
-    cap = cv2.VideoCapture(args.cam_id, cv2.CAP_V4L2)
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, args.width)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, args.height)
-    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
+    # Reopen camera for rectification preview
+    if args.cam_mode == 'shm':
+        preview_reader = SharedMemoryStereoReader()
+        print("Press any key in the preview window to exit.")
+        img_l, img_r = preview_reader.read()
+    else:
+        preview_reader = None
+        cap2 = cv2.VideoCapture(args.cam_id, cv2.CAP_V4L2)
+        cap2.set(cv2.CAP_PROP_FRAME_WIDTH, args.width)
+        cap2.set(cv2.CAP_PROP_FRAME_HEIGHT, args.height)
+        cap2.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
+        for _ in range(5):
+            cap2.read()
+        print("Press any key in the preview window to exit.")
+        ret, frame = cap2.read()
+        if ret:
+            mid_px = frame.shape[1] // 2
+            img_l = frame[:, :mid_px]
+            img_r = frame[:, mid_px:]
+        else:
+            img_l = img_r = None
 
-    for _ in range(5):
-        cap.read()
-
-    ret, frame = cap.read()
-    if ret:
-        mid_px = frame.shape[1] // 2
-        img_l = frame[:, :mid_px]
-        img_r = frame[:, mid_px:]
+    if img_l is not None:
 
         rect_l = cv2.remap(img_l, map_lx, map_ly, cv2.INTER_LINEAR)
         rect_r = cv2.remap(img_r, map_rx, map_ry, cv2.INTER_LINEAR)
@@ -187,7 +227,10 @@ def main():
         cv2.imshow('Rectification Check (lines should align)', preview)
         cv2.waitKey(0)
 
-    cap.release()
+    if preview_reader is not None:
+        preview_reader.close()
+    if 'cap2' in dir():
+        cap2.release()
     cv2.destroyAllWindows()
 
 

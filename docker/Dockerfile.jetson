@@ -1,0 +1,170 @@
+# Fast-FoundationStereo Dockerfile for Jetson T4000 (ARM64 / L4T R38.4)
+#
+# Prerequisites:
+#   1. NGC account: https://ngc.nvidia.com/signup
+#   2. API key:     https://ngc.nvidia.com/setup/api-key
+#   3. Login:       docker login nvcr.io
+#                     Username: $oauthtoken
+#                     Password: <your-api-key>
+#   4. Verify JetPack on your board: dpkg -l | grep nvidia-jetpack
+#
+# Build:
+#   docker build -t ffs-jetson -f docker/Dockerfile.jetson .
+#
+# Run:
+#   bash docker/run_jetson.sh
+
+# ============================================================
+# Base image: NVIDIA PyTorch for Jetson (JetPack 7.x / L4T R38)
+# Includes: CUDA, cuDNN, TensorRT, PyTorch, torchvision
+#
+# JetPack 7.x (L4T R38) unified pytorch containers on nvcr.io:
+#   25.08-py3  (PyTorch 2.8,  JetPack 7.0) — confirmed working on Thor
+#   25.11-py3  (PyTorch 2.10, JetPack 7.0)
+#   25.12-py3  (PyTorch 2.10, JetPack 7.1)
+#   26.01-py3  (PyTorch 2.10, JetPack 7.1)
+#   26.04-py3  (PyTorch 2.12, JetPack 7.1)
+#
+# The container is multi-arch — pulls arm64 automatically on Jetson.
+# ============================================================
+FROM nvcr.io/nvidia/pytorch:25.08-py3
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV TZ=Asia/Shanghai
+RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
+
+# ============================================================
+# System dependencies
+# ============================================================
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        git \
+        libturbojpeg-dev \
+        ffmpeg \
+        libsm6 \
+        libxext6 \
+        libxrender-dev \
+        libgomp1 \
+        libglib2.0-0 \
+        libxkbcommon-x11-0 \
+        libxcb-xinerama0 \
+        libxcb-icccm4 \
+        libxcb-render-util0 \
+        libxcb-shape0 \
+        libxcb-keysyms1 \
+        libxcb-image0 \
+        libxcb-cursor0 \
+        libxcb-xkb1 \
+        libxcb-render0 \
+        libxcb-shm0 \
+        libxcb-sync1 \
+        libxcb-xfixes0 \
+        libxcb-randr0 \
+        libxcb-xtest0 \
+    && rm -rf /var/lib/apt/lists/*
+
+
+WORKDIR /workspace
+
+# ============================================================
+# Python dependencies (installed with uv for speed)
+# PyTorch / torchvision / CUDA / cuDNN / TensorRT already in base image.
+# xformers and triton are NOT available on Jetson ARM64 — skipped.
+# nvidia-cuda-* wheels are pre-installed as system libs on L4T — skipped.
+# ============================================================
+# Allow passing proxy via --build-arg; defaults to empty (no proxy)
+#   docker build --build-arg HTTP_PROXY=http://x.x.x.x:port ...
+ARG HTTP_PROXY
+ARG HTTPS_PROXY
+ARG http_proxy
+ARG https_proxy
+ARG NO_PROXY
+ENV HTTP_PROXY=${HTTP_PROXY} \
+    HTTPS_PROXY=${HTTPS_PROXY} \
+    http_proxy=${http_proxy} \
+    https_proxy=${https_proxy} \
+    NO_PROXY=${NO_PROXY}
+
+# Remove EXTERNALLY-MANAGED to allow pip/uv system installs in container
+RUN rm -f /usr/lib/python3.*/EXTERNALLY-MANAGED
+COPY requirements.txt /tmp/requirements.txt
+# open3d removed: no aarch64+cp312 wheel available
+# open3d excluded: no aarch64+cp312 wheel; build from source if needed:
+#   pip install --no-cache-dir open3d --no-binary open3d
+RUN grep -v '^open3d\|^numpy' /tmp/requirements.txt > /tmp/requirements_filtered.txt && \
+    pip install --no-cache-dir uv && \
+    uv pip install --system --no-cache \
+        -r /tmp/requirements_filtered.txt \
+        matplotlib \
+        pandas \
+        transformers \
+        tokenizers \
+        huggingface-hub \
+        ultralytics \
+        ultralytics-thop \
+        modelscope \
+        addict \
+        flask \
+        dash \
+        plotly \
+        tqdm \
+        rich \
+        pyquaternion \
+        scikit-learn \
+        networkx \
+        sympy \
+        ftfy \
+        regex \
+        psutil \
+        retrying \
+        configargparse \
+        typer \
+        safetensors \
+        tifffile \
+        ipython \
+        pexpect \
+        click \
+        pyyaml \
+        omegaconf \
+        einops \
+        timm
+
+# ============================================================
+# Install CLIP (required by YOLO-World for text encoding)
+# Prefer local source if available; otherwise try online install.
+# To use local source:
+#   1. On a machine with internet: git clone https://github.com/ultralytics/CLIP.git
+#   2. Copy the CLIP/ folder to docker/clip/ in this project
+#   3. Rebuild: docker build -t ffs-jetson -f docker/Dockerfile.jetson .
+# ============================================================
+COPY docker/clip/ /tmp/clip_src/
+RUN if [ -f /tmp/clip_src/pyproject.toml ] || [ -f /tmp/clip_src/setup.py ]; then \
+        echo "Installing CLIP from local source..."; \
+        pip install --no-cache-dir /tmp/clip_src/; \
+    else \
+        echo "Local CLIP not found, trying online install..."; \
+        pip install --no-cache-dir git+https://github.com/ultralytics/CLIP.git || \
+        echo "WARNING: CLIP install failed (no network). YOLO-World text encoding will not work."; \
+    fi
+
+# Fix NumPy compatibility: PyTorch 25.08 was compiled against NumPy 1.x but
+# later pip installs may pull in NumPy 2.x. Downgrade as the LAST pip step.
+RUN pip install --no-cache-dir "numpy<2"
+
+# ============================================================
+# Copy project code
+# Weights / models / calibrations / output are mounted at runtime.
+# ============================================================
+COPY perception/   /workspace/perception/
+COPY core/         /workspace/core/
+COPY detectors/    /workspace/detectors/
+COPY GroundingDINO/ /workspace/GroundingDINO/
+COPY yolo-worldv2/ /workspace/yolo-worldv2/
+COPY scripts/      /workspace/scripts/
+COPY Utils.py      /workspace/
+COPY *.pt          /workspace/
+
+# Pre-create directories that are volume-mounted at runtime
+RUN mkdir -p /workspace/weights /workspace/models /workspace/output /workspace/calibrations /workspace/demo_data
+
+CMD ["/bin/bash"]

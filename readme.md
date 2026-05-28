@@ -75,6 +75,49 @@ python scripts/run_demo.py \
 - For faster inference, reduce `--valid_iters 4` and/or `--scale 0.5`.
 - The 1st time running is slower due to CUDA kernel compilation.
 
+# GEAC IMX185 Stereo Camera Setup (Jetson)
+
+The new stereo camera uses GEAC GMSL max96712 deserializers with IMX185 sensors, accessed via NVIDIA's nvargus camera stack. Unlike the old DECXIN USB camera (single side-by-side V4L2 device), these are two independent CSI cameras.
+
+## Hardware init (once per boot)
+
+```bash
+# 1. Initialize GEAC camera hardware
+cd /home/nvidia/camera_demo_geac
+sudo bash camera_init.sh
+
+# 2. Start the camera bridge (feeds frames to Docker via /dev/shm)
+cd /home/nvidia/perception/Fast-FoundationStereo
+python scripts/camera_bridge.py \
+    --left_sensor 0 \
+    --right_sensor 1 \
+    --width 1920 \
+    --height 1200 \
+    --fps 30 &
+
+# Or use the combined setup script:
+bash scripts/setup_camera.sh
+```
+
+The camera bridge captures from both IMX185 sensors via GStreamer and writes stereo frames to `/dev/shm/` for the Docker container.
+
+## Run perception in Docker (new camera)
+
+```bash
+bash docker/run_jetson.sh python scripts/run_perception.py \
+    --cam_mode shm \
+    --detector_type yolo_world \
+    --model_dir weights/20-30-48/model_best_bp2_serialize.pth \
+    --calib_file calibrations/stereo_calib.npz \
+    --yolo_weights weights/yolo_world_finetuned/model_best.pt \
+    --text_prompt "a cup. a bottle." \
+    --depth_scale 1.1513 \
+    --disp_offset 0.8668 \
+    --scale 0.5 --save_dir output/screenshots/
+```
+
+Note: You'll need a new calibration for the IMX185 cameras (1920x1200, different baseline). See the calibration section below.
+
 # Stereo camera calibration (DECXIN-2784V1)
 
 Print the chessboard at `calibrations/chessboard_9x6_25mm.png` with 100% scale (25mm per square). Adjust `--chessboard_cols` / `--chessboard_rows` / `--square_size` for your own board.
